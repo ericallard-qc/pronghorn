@@ -1,150 +1,179 @@
 
 
-# Fix: IP Allow List Updates for Existing Render Databases
+# Fix: Pronghorn Runner Sync Loop Prevention
 
-## Problem Summary
+## Root Cause
 
-When editing an existing Render database, changing the IP allow list (e.g., clicking "Allow Any IP") saves to the local database but **does not update Render**. This is because:
+The bidirectional sync loop occurs because:
 
-1. **Frontend issue**: Only calls `render-database` edge function when the plan changes
-2. **Backend issue**: The `updateRenderDatabase` function doesn't include `ipAllowList` in the PATCH request
+1. **Cloud writes trigger the local watcher**: When `syncStagingToLocal()` writes a file to disk, chokidar sees it as a local change and calls `pushLocalChangeToCloud()`
+2. **Push triggers a broadcast**: The `staging-operations` edge function always broadcasts `staging_refresh` after any stage operation
+3. **Broadcast triggers another sync**: The runner receives the broadcast and calls `syncStagingToLocal()` again
+4. **No origin tracking**: The runner has no way to distinguish "I wrote this file" from "the user edited this file"
 
-## Solution
+This is especially bad during rapid Claude Code editing because dozens of files change within seconds, creating cascading loops.
 
-### Part 1: Update Edge Function to Accept and Send ipAllowList
+## Proposed Solution: Three-Layer Defense
 
-**File**: `supabase/functions/render-database/index.ts`
+### Layer 1: Write Origin Tracking (Primary Fix)
 
-**Changes**:
-1. Add `ipAllowList` to the `RenderDatabaseRequest` interface
-2. Update `updateRenderDatabase` function to include `ipAllowList` in the PATCH payload
-3. The database record already has the updated `ip_allow_list` from the local save, so we can read it from there
+Track files that the runner itself writes to disk. When chokidar fires for those files, skip the push.
 
-```typescript
-// Update interface (around line 10)
-interface RenderDatabaseRequest {
-  action: 'create' | 'status' | 'update' | 'delete' | 'suspend' | 'resume' | 'restart' | 'connectionInfo';
-  databaseId: string;
-  shareToken?: string;
-  plan?: string;
-  version?: string;
-  region?: string;
-  ipAllowList?: Array<{ cidrBlock: string; description: string }>; // ADD THIS
-}
+```text
+// New state tracking
+let cloudWrittenFiles = new Map();  // path → { hash, timestamp }
+const CLOUD_WRITE_COOLDOWN_MS = 2000;
 
-// Update the updateRenderDatabase function (lines 222-260)
-async function updateRenderDatabase(
-  database: any,
-  body: RenderDatabaseRequest,
-  headers: Record<string, string>,
-  supabase: any,
-  shareToken?: string
-) {
-  if (!database.render_postgres_id) {
-    throw new Error("Database not yet created on Render");
+// In syncStagingToLocal(), BEFORE writing:
+cloudWrittenFiles.set(relativePath, { 
+  hash: hashContent(newContent), 
+  timestamp: Date.now() 
+});
+
+// In chokidar handlers (add/change), BEFORE pushing:
+const tracked = cloudWrittenFiles.get(relativePath);
+if (tracked) {
+  const localHash = hashContent(content);
+  const elapsed = Date.now() - tracked.timestamp;
+  if (localHash === tracked.hash || elapsed < CLOUD_WRITE_COOLDOWN_MS) {
+    // This write came from us, skip push
+    cloudWrittenFiles.delete(relativePath);
+    return;
   }
-
-  const updatePayload: any = {};
-  
-  // Include plan if provided
-  if (body.plan) {
-    updatePayload.plan = body.plan;
-  }
-  
-  // Include ipAllowList - use from body if provided, otherwise from database record
-  if (body.ipAllowList !== undefined) {
-    updatePayload.ipAllowList = body.ipAllowList;
-  } else if (database.ip_allow_list && Array.isArray(database.ip_allow_list)) {
-    updatePayload.ipAllowList = database.ip_allow_list;
-  }
-
-  // Only call Render API if there's something to update
-  if (Object.keys(updatePayload).length === 0) {
-    return { message: "No changes to sync to Render" };
-  }
-
-  console.log("[render-database] Update payload:", JSON.stringify(updatePayload));
-
-  const response = await fetch(`${RENDER_API_URL}/postgres/${database.render_postgres_id}`, {
-    method: "PATCH",
-    headers,
-    body: JSON.stringify(updatePayload),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Failed to update database: ${errorText}`);
-  }
-
-  const renderData = await response.json();
-
-  // Update local record status if plan changed
-  if (body.plan) {
-    await supabase.rpc("update_database_with_token", {
-      p_database_id: database.id,
-      p_token: shareToken || null,
-      p_plan: body.plan,
-      p_status: "updating",
-    });
-  }
-
-  return renderData;
 }
 ```
 
----
+This is the single most impactful change. It prevents the echo where cloud-written files bounce back to the cloud.
 
-### Part 2: Update Frontend to Trigger Render Sync for IP Changes
+### Layer 2: Increase Debounce for Rapid Editing
 
-**File**: `src/components/deploy/DatabaseDialog.tsx`
+Change the staging sync debounce from 150ms to 1500ms (1.5 seconds) during burst activity. This collapses rapid Claude Code edits into a single sync pass.
 
-**Changes**: Modify the edit logic (around lines 234-254) to also trigger a Render sync when the IP allow list changes
+```text
+const STAGING_DEBOUNCE_MS = 150;     // Normal single-file edits
+const STAGING_BURST_DEBOUNCE_MS = 1500; // When multiple events arrive rapidly
 
-```typescript
-// After saving to local database (line 233), check if Render sync is needed
-if (database.render_postgres_id) {
-  const planChanged = form.plan !== database.plan;
-  const ipListChanged = JSON.stringify(finalIpAllowList) !== JSON.stringify(database.ip_allow_list || []);
+let stagingEventCount = 0;
+let stagingBurstTimer = null;
+
+function scheduleStagingSync() {
+  stagingEventCount++;
+  clearTimeout(stagingSyncTimer);
   
-  if (planChanged || ipListChanged) {
-    const { error: renderError } = await supabase.functions.invoke("render-database", {
-      body: {
-        action: "update",
-        databaseId: database.id,
-        shareToken,
-        plan: planChanged ? form.plan : undefined,
-        ipAllowList: ipListChanged ? finalIpAllowList : undefined,
-      },
-    });
+  // If we've received 3+ events in quick succession, use longer debounce
+  const debounceMs = stagingEventCount > 3 
+    ? STAGING_BURST_DEBOUNCE_MS 
+    : STAGING_DEBOUNCE_MS;
+  
+  stagingSyncTimer = setTimeout(async () => {
+    stagingEventCount = 0;
+    await syncStagingToLocal();
+  }, debounceMs);
+}
+```
 
-    if (renderError) {
-      toast.warning("Saved locally, but failed to sync to Render");
-    } else {
-      toast.success("Database updated and synced to Render");
+### Layer 3: Manual Sync Mode (New Feature)
+
+Add a keyboard-driven sync mode where the user controls when syncs happen. This is critical for Claude Code sessions where dozens of files change rapidly.
+
+```text
+// New .run config option
+SYNC_MODE=auto         // 'auto' (current behavior) or 'manual'
+MANUAL_SYNC_PROMPT=true  // Show 'Press Y to sync' prompts
+
+// In manual mode:
+// - Cloud → Local: queues changes, shows "5 files pending, press Y to pull"
+// - Local → Cloud: queues changes, shows "3 files pending, press P to push"  
+// - Press S for full bidirectional sync pass
+// - Press A to switch back to auto mode
+```
+
+Implementation uses Node.js `readline` to capture keypresses:
+
+```text
+const readline = require('readline');
+
+function setupManualSyncMode() {
+  readline.emitKeypressEvents(process.stdin);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  
+  let pendingCloudChanges = [];
+  let pendingLocalChanges = [];
+  
+  process.stdin.on('keypress', async (str, key) => {
+    if (key.name === 'y') {
+      // Pull cloud → local
+      await syncStagingToLocal();
+      console.log('[Pronghorn] Manual pull complete');
     }
-  } else {
-    toast.success("Database configuration updated");
-  }
-} else {
-  toast.success("Database configuration updated");
+    if (key.name === 'p') {
+      // Push local → cloud (flush queue)
+      for (const change of pendingLocalChanges) {
+        await pushLocalChangeToCloud(change.path, change.op, change.content);
+      }
+      pendingLocalChanges = [];
+    }
+    if (key.name === 's') {
+      // Full bidirectional sync
+      await syncStagingToLocal();
+      for (const change of pendingLocalChanges) {
+        await pushLocalChangeToCloud(change.path, change.op, change.content);
+      }
+      pendingLocalChanges = [];
+    }
+    if (key.name === 'a') {
+      // Toggle auto/manual
+      CONFIG.syncMode = CONFIG.syncMode === 'auto' ? 'manual' : 'auto';
+      console.log(`[Pronghorn] Sync mode: ${CONFIG.syncMode}`);
+    }
+    if (key.ctrl && key.name === 'c') {
+      process.exit(0);
+    }
+  });
 }
 ```
 
 ---
 
-## Implementation Summary
+## Changes Summary
 
-| File | Change |
-|------|--------|
-| `supabase/functions/render-database/index.ts` | Add `ipAllowList` to interface and PATCH payload |
-| `src/components/deploy/DatabaseDialog.tsx` | Trigger Render sync when IP allow list changes |
+All changes are in a single file: `supabase/functions/generate-local-package/index.ts` (the generated runner script).
+
+| Change | Layer | Impact |
+|--------|-------|--------|
+| `cloudWrittenFiles` tracking map | 1 - Origin tracking | Prevents echo loops entirely |
+| Hash comparison before push | 1 - Origin tracking | Skips identical content pushes |
+| Cooldown window (2s) after cloud writes | 1 - Origin tracking | Safety net for hash collisions |
+| Burst detection with adaptive debounce | 2 - Debounce | Collapses rapid edits into single sync |
+| `SYNC_MODE=manual` option | 3 - Manual mode | Full user control during Claude sessions |
+| Keypress handlers (Y/P/S/A) | 3 - Manual mode | Interactive sync control |
+| `SYNC_MODE` config in .run file | 3 - Manual mode | Persistent preference |
+| Status line showing pending changes | 3 - Manual mode | Visibility into queue state |
+
+## New .run Configuration Options
+
+```text
+# SYNC SETTINGS (updated)
+REBUILD_ON_STAGING=true
+REBUILD_ON_FILES=true
+PUSH_LOCAL_CHANGES=true
+
+# NEW: Sync mode - 'auto' (realtime) or 'manual' (press keys to sync)
+SYNC_MODE=auto
+```
 
 ## Expected Behavior After Fix
 
-1. User edits existing Render database
-2. User clicks "Allow Any IP" toggle
-3. User clicks Save
-4. **Local database** saves with new `ip_allow_list` ✓
-5. **Render API** receives PATCH with `ipAllowList` ✓
-6. Render updates the database networking rules ✓
+**Auto mode (default)**:
+- Cloud writes a file locally → chokidar fires → hash matches `cloudWrittenFiles` → push skipped (no loop)
+- User edits a file locally → chokidar fires → hash does NOT match → push proceeds normally
+- Claude Code edits 20 files rapidly → burst debounce collapses to single sync after 1.5s quiet period
+
+**Manual mode (for Claude Code sessions)**:
+- Cloud changes arrive → queued, status line shows "5 files pending pull"
+- User presses Y → all pending cloud changes written to disk at once
+- Local changes detected → queued, status shows "3 files pending push"
+- User presses P → all pending local changes pushed to cloud
+- User presses S → full bidirectional sync in one pass
+- User presses A → toggle back to auto mode
 
