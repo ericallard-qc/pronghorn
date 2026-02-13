@@ -69,6 +69,9 @@ interface DatabaseSchemaTreeProps {
   // New bulk operations
   onDeleteAllMigrations?: (migrations: Migration[]) => void;
   onDropSchema?: (schemaName: string, schemaInfo: SchemaInfo) => void;
+  // DDL download handlers
+  onDownloadTableDDL?: (schema: string, tableName: string) => void;
+  onDownloadSchemaDDL?: (schemaName: string, schemaInfo: SchemaInfo) => void;
 }
 
 type TreeItemType = 'schema' | 'category' | 'table' | 'view' | 'function' | 'trigger' | 'index' | 'sequence' | 'type' | 'constraint' | 'saved_query' | 'migration' | 'category_tables' | 'category_views' | 'category_functions' | 'category_triggers' | 'category_indexes' | 'category_sequences' | 'category_types' | 'category_constraints' | 'category_migrations';
@@ -109,6 +112,8 @@ interface TreeItemProps {
     onDropAllConstraints?: (schema: string, constraints: { name: string; table: string }[]) => void;
     onDeleteAllMigrations?: (migrations: any[]) => void;
     onDropSchema?: (schemaName: string, schemaInfo: any) => void;
+    onDownloadTableDDL?: (schema: string, tableName: string) => void;
+    onDownloadSchemaDDL?: (schemaName: string, schemaInfo: any) => void;
   };
 }
 
@@ -219,6 +224,8 @@ function TreeItem({
           onDropAllConstraints={contextMenuProps.onDropAllConstraints}
           onDeleteAllMigrations={contextMenuProps.onDeleteAllMigrations}
           onDropSchema={contextMenuProps.onDropSchema}
+          onDownloadTableDDL={contextMenuProps.onDownloadTableDDL}
+          onDownloadSchemaDDL={contextMenuProps.onDownloadSchemaDDL}
         >
           {itemButton}
         </DatabaseTreeContextMenu>
@@ -259,6 +266,8 @@ export function DatabaseSchemaTree({
   onDropAllConstraints,
   onDeleteAllMigrations,
   onDropSchema,
+  onDownloadTableDDL,
+  onDownloadSchemaDDL,
 }: DatabaseSchemaTreeProps) {
   const [searchTerm, setSearchTerm] = useState("");
   
@@ -304,6 +313,8 @@ export function DatabaseSchemaTree({
     onDropAllConstraints,
     onDeleteAllMigrations,
     onDropSchema,
+    onDownloadTableDDL,
+    onDownloadSchemaDDL,
   };
 
   const filteredSchemas = useMemo(() => {
