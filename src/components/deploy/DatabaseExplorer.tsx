@@ -723,6 +723,63 @@ export function DatabaseExplorer({ database, externalConnection, shareToken, onB
     setPendingDropSchema(null);
   };
 
+  // DDL download utility
+  const downloadSqlFile = (filename: string, content: string) => {
+    const blob = new Blob([content], { type: 'application/sql' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadTableDDL = async (schema: string, tableName: string) => {
+    try {
+      toast.info(`Fetching DDL for ${schema}.${tableName}...`);
+      const result = await invokeManageDatabase("get_table_definition", { schema, table: tableName });
+      if (result.definition) {
+        downloadSqlFile(`${schema}.${tableName}.sql`, result.definition);
+        toast.success(`Downloaded ${schema}.${tableName}.sql`);
+      } else {
+        toast.error("No definition returned");
+      }
+    } catch (error: any) {
+      toast.error(`Failed to get DDL: ${error.message}`);
+    }
+  };
+
+  const handleDownloadSchemaDDL = async (schemaName: string, schemaInfo: any) => {
+    const tables: string[] = schemaInfo?.tables || [];
+    if (tables.length === 0) {
+      toast.error("No tables in this schema");
+      return;
+    }
+    try {
+      toast.info(`Fetching DDL for ${tables.length} tables in ${schemaName}...`);
+      const parts: string[] = [`-- Schema: ${schemaName}`, `-- Generated: ${new Date().toISOString()}`, `-- Tables: ${tables.length}`, ''];
+      for (let i = 0; i < tables.length; i++) {
+        toast.info(`Fetching ${i + 1}/${tables.length}: ${tables[i]}...`);
+        try {
+          const result = await invokeManageDatabase("get_table_definition", { schema: schemaName, table: tables[i] });
+          parts.push(`-- Table: ${schemaName}.${tables[i]}`);
+          parts.push(result.definition || `-- Could not retrieve definition for ${tables[i]}`);
+          parts.push('');
+        } catch (e: any) {
+          parts.push(`-- Table: ${schemaName}.${tables[i]}`);
+          parts.push(`-- ERROR: ${e.message}`);
+          parts.push('');
+        }
+      }
+      downloadSqlFile(`${schemaName}_schema.sql`, parts.join('\n'));
+      toast.success(`Downloaded ${schemaName}_schema.sql (${tables.length} tables)`);
+    } catch (error: any) {
+      toast.error(`Failed to download schema DDL: ${error.message}`);
+    }
+  };
+
   const handleExport = async (format: 'json' | 'csv' | 'sql') => {
     if (!selectedTable) return;
     try {
@@ -764,7 +821,7 @@ export function DatabaseExplorer({ database, externalConnection, shareToken, onB
         {schemaError ? (
           <div className="flex flex-col items-center justify-center h-full p-4 text-center"><AlertCircle className="h-8 w-8 text-destructive mb-2" /><p className="text-sm text-destructive">{schemaError}</p><Button variant="outline" size="sm" onClick={() => loadSchema()} className="mt-4">Retry</Button></div>
         ) : (
-          <DatabaseSchemaTree schemas={schemas} savedQueries={savedQueries} migrations={migrations} loading={loadingSchema} onTableSelect={handleTableSelect} onViewSelect={(s, v) => { setCurrentQuery(`SELECT * FROM "${s}"."${v}" LIMIT 100;`); setActiveTab('query'); if (isMobile) setMobileActiveTab("query"); }} onItemClick={(t, s, n, e) => { if (t === 'table') handleTableSelect(s, n); }} onShowFirst100={handleShowFirst100} onViewStructure={handleViewStructure} onGetDefinition={handleGetDefinition} onDropTable={handleDropTable} onLoadQuery={handleLoadQuery} onEditQuery={handleEditQuery} onDeleteQuery={handleDeleteQuery} onLoadMigration={handleLoadMigration} onDeleteMigration={handleDeleteMigration} onDownloadMigration={handleDownloadMigration} onDownloadAllMigrations={handleDownloadAllMigrations} onDropAllTables={handleDropAllTables} onDropAllViews={handleDropAllViews} onDropAllFunctions={handleDropAllFunctions} onDropAllTriggers={handleDropAllTriggers} onDropAllIndexes={handleDropAllIndexes} onDropAllSequences={handleDropAllSequences} onDropAllTypes={handleDropAllTypes} onDropAllConstraints={handleDropAllConstraints} onDeleteAllMigrations={handleDeleteAllMigrationsRequest} onDropSchema={handleDropSchemaRequest} />
+          <DatabaseSchemaTree schemas={schemas} savedQueries={savedQueries} migrations={migrations} loading={loadingSchema} onTableSelect={handleTableSelect} onViewSelect={(s, v) => { setCurrentQuery(`SELECT * FROM "${s}"."${v}" LIMIT 100;`); setActiveTab('query'); if (isMobile) setMobileActiveTab("query"); }} onItemClick={(t, s, n, e) => { if (t === 'table') handleTableSelect(s, n); }} onShowFirst100={handleShowFirst100} onViewStructure={handleViewStructure} onGetDefinition={handleGetDefinition} onDropTable={handleDropTable} onLoadQuery={handleLoadQuery} onEditQuery={handleEditQuery} onDeleteQuery={handleDeleteQuery} onLoadMigration={handleLoadMigration} onDeleteMigration={handleDeleteMigration} onDownloadMigration={handleDownloadMigration} onDownloadAllMigrations={handleDownloadAllMigrations} onDropAllTables={handleDropAllTables} onDropAllViews={handleDropAllViews} onDropAllFunctions={handleDropAllFunctions} onDropAllTriggers={handleDropAllTriggers} onDropAllIndexes={handleDropAllIndexes} onDropAllSequences={handleDropAllSequences} onDropAllTypes={handleDropAllTypes} onDropAllConstraints={handleDropAllConstraints} onDeleteAllMigrations={handleDeleteAllMigrationsRequest} onDropSchema={handleDropSchemaRequest} onDownloadTableDDL={handleDownloadTableDDL} onDownloadSchemaDDL={handleDownloadSchemaDDL} />
         )}
       </div>
     </div>

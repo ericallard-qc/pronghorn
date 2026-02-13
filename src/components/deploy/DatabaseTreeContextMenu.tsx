@@ -69,6 +69,9 @@ interface DatabaseTreeContextMenuProps {
   // New bulk operations
   onDeleteAllMigrations?: (migrations: any[]) => void;
   onDropSchema?: (schemaName: string, schemaInfo: any) => void;
+  // DDL download handlers
+  onDownloadTableDDL?: (schema: string, tableName: string) => void;
+  onDownloadSchemaDDL?: (schemaName: string, schemaInfo: any) => void;
 }
 
 export function DatabaseTreeContextMenu({
@@ -98,6 +101,8 @@ export function DatabaseTreeContextMenu({
   onDropAllConstraints,
   onDeleteAllMigrations,
   onDropSchema,
+  onDownloadTableDDL,
+  onDownloadSchemaDDL,
 }: DatabaseTreeContextMenuProps) {
   const handleCopyName = () => {
     const fullName = schema ? `"${schema}"."${name}"` : name;
@@ -131,6 +136,10 @@ export function DatabaseTreeContextMenu({
             <ContextMenuItem onClick={() => onGetDefinition?.(type, schema, name)}>
               <Code className="h-4 w-4 mr-2" />
               Get CREATE TABLE
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => onDownloadTableDDL?.(schema, name)}>
+              <Download className="h-4 w-4 mr-2" />
+              Download DDL (.sql)
             </ContextMenuItem>
             <ContextMenuItem onClick={handleCopyName}>
               <Copy className="h-4 w-4 mr-2" />
@@ -397,15 +406,22 @@ export function DatabaseTreeContextMenu({
           </ContextMenuItem>
         )}
 
-        {/* Schema - Drop Entire Schema */}
+        {/* Schema context menu */}
         {type === 'schema' && (
-          <ContextMenuItem 
-            onClick={() => onDropSchema?.(name, extra)}
-            className="text-destructive focus:text-destructive"
-          >
-            <Trash2 className="h-4 w-4 mr-2" />
-            Drop Schema CASCADE
-          </ContextMenuItem>
+          <>
+            <ContextMenuItem onClick={() => onDownloadSchemaDDL?.(name, extra)}>
+              <Download className="h-4 w-4 mr-2" />
+              Download Schema DDL (.sql)
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem 
+              onClick={() => onDropSchema?.(name, extra)}
+              className="text-destructive focus:text-destructive"
+            >
+              <Trash2 className="h-4 w-4 mr-2" />
+              Drop Schema CASCADE
+            </ContextMenuItem>
+          </>
         )}
       </ContextMenuContent>
     </ContextMenu>
