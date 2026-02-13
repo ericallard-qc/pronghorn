@@ -1,179 +1,81 @@
 
 
-# Fix: Pronghorn Runner Sync Loop Prevention
+# Download DDL Definitions from Database Explorer
 
-## Root Cause
+## Overview
 
-The bidirectional sync loop occurs because:
+Add two new right-click context menu options:
+1. **Single table**: "Download DDL (.sql)" - downloads the CREATE TABLE statement as a `.sql` file
+2. **Schema node**: "Download Schema DDL (.sql)" - downloads all table definitions in that schema as a single `.sql` file
 
-1. **Cloud writes trigger the local watcher**: When `syncStagingToLocal()` writes a file to disk, chokidar sees it as a local change and calls `pushLocalChangeToCloud()`
-2. **Push triggers a broadcast**: The `staging-operations` edge function always broadcasts `staging_refresh` after any stage operation
-3. **Broadcast triggers another sync**: The runner receives the broadcast and calls `syncStagingToLocal()` again
-4. **No origin tracking**: The runner has no way to distinguish "I wrote this file" from "the user edited this file"
+## Changes
 
-This is especially bad during rapid Claude Code editing because dozens of files change within seconds, creating cascading loops.
+### 1. DatabaseTreeContextMenu.tsx
 
-## Proposed Solution: Three-Layer Defense
+Add two new callback props and menu items:
 
-### Layer 1: Write Origin Tracking (Primary Fix)
+- **Props**: `onDownloadTableDDL` and `onDownloadSchemaDDL`
+- **Table menu**: Add a "Download DDL (.sql)" item with the Download icon, after the existing "Get CREATE TABLE" item
+- **Schema menu**: Add a "Download Schema DDL (.sql)" item with the Download icon, before the existing "Drop Schema CASCADE" item
 
-Track files that the runner itself writes to disk. When chokidar fires for those files, skip the push.
+### 2. DatabaseSchemaTree.tsx
 
-```text
-// New state tracking
-let cloudWrittenFiles = new Map();  // path → { hash, timestamp }
-const CLOUD_WRITE_COOLDOWN_MS = 2000;
+Thread the two new props through the component tree:
 
-// In syncStagingToLocal(), BEFORE writing:
-cloudWrittenFiles.set(relativePath, { 
-  hash: hashContent(newContent), 
-  timestamp: Date.now() 
-});
+- Add `onDownloadTableDDL` and `onDownloadSchemaDDL` to the `DatabaseSchemaTreeProps` interface
+- Pass them into the `contextMenuProps` object
 
-// In chokidar handlers (add/change), BEFORE pushing:
-const tracked = cloudWrittenFiles.get(relativePath);
-if (tracked) {
-  const localHash = hashContent(content);
-  const elapsed = Date.now() - tracked.timestamp;
-  if (localHash === tracked.hash || elapsed < CLOUD_WRITE_COOLDOWN_MS) {
-    // This write came from us, skip push
-    cloudWrittenFiles.delete(relativePath);
-    return;
-  }
+### 3. DatabaseExplorer.tsx
+
+Implement the two handler functions:
+
+**`handleDownloadTableDDL(schema, tableName)`**:
+- Calls the existing `manage-database` edge function with action `get_table_definition`
+- Takes the returned DDL string and triggers a browser download as `{schema}.{tableName}.sql`
+- Shows a toast on success/failure
+
+**`handleDownloadSchemaDDL(schemaName, schemaInfo)`**:
+- Iterates over all tables in `schemaInfo.tables`
+- For each table, calls the `manage-database` edge function with `get_table_definition`
+- Concatenates all DDL results separated by `\n\n` with comment headers (`-- Table: tablename`)
+- Triggers a browser download as `{schemaName}_schema.sql`
+- Shows progress toast ("Fetching 1/N...") during the process
+
+Both handlers use a simple utility to trigger the download:
+
+```typescript
+function downloadSqlFile(filename: string, content: string) {
+  const blob = new Blob([content], { type: 'application/sql' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 ```
 
-This is the single most impactful change. It prevents the echo where cloud-written files bounce back to the cloud.
+## Technical Details
 
-### Layer 2: Increase Debounce for Rapid Editing
+### File Changes Summary
 
-Change the staging sync debounce from 150ms to 1500ms (1.5 seconds) during burst activity. This collapses rapid Claude Code edits into a single sync pass.
+| File | Change |
+|------|--------|
+| `src/components/deploy/DatabaseTreeContextMenu.tsx` | Add `onDownloadTableDDL` and `onDownloadSchemaDDL` props; add menu items for table and schema types |
+| `src/components/deploy/DatabaseSchemaTree.tsx` | Thread new props through to context menu |
+| `src/components/deploy/DatabaseExplorer.tsx` | Implement `handleDownloadTableDDL` and `handleDownloadSchemaDDL` handlers; pass them to the tree |
 
-```text
-const STAGING_DEBOUNCE_MS = 150;     // Normal single-file edits
-const STAGING_BURST_DEBOUNCE_MS = 1500; // When multiple events arrive rapidly
+### Context Menu Additions
 
-let stagingEventCount = 0;
-let stagingBurstTimer = null;
-
-function scheduleStagingSync() {
-  stagingEventCount++;
-  clearTimeout(stagingSyncTimer);
-  
-  // If we've received 3+ events in quick succession, use longer debounce
-  const debounceMs = stagingEventCount > 3 
-    ? STAGING_BURST_DEBOUNCE_MS 
-    : STAGING_DEBOUNCE_MS;
-  
-  stagingSyncTimer = setTimeout(async () => {
-    stagingEventCount = 0;
-    await syncStagingToLocal();
-  }, debounceMs);
-}
+**Table node** (after "Get CREATE TABLE"):
+```
+[Download icon] Download DDL (.sql)
 ```
 
-### Layer 3: Manual Sync Mode (New Feature)
-
-Add a keyboard-driven sync mode where the user controls when syncs happen. This is critical for Claude Code sessions where dozens of files change rapidly.
-
-```text
-// New .run config option
-SYNC_MODE=auto         // 'auto' (current behavior) or 'manual'
-MANUAL_SYNC_PROMPT=true  // Show 'Press Y to sync' prompts
-
-// In manual mode:
-// - Cloud → Local: queues changes, shows "5 files pending, press Y to pull"
-// - Local → Cloud: queues changes, shows "3 files pending, press P to push"  
-// - Press S for full bidirectional sync pass
-// - Press A to switch back to auto mode
+**Schema node** (before "Drop Schema CASCADE"):
 ```
-
-Implementation uses Node.js `readline` to capture keypresses:
-
-```text
-const readline = require('readline');
-
-function setupManualSyncMode() {
-  readline.emitKeypressEvents(process.stdin);
-  if (process.stdin.isTTY) process.stdin.setRawMode(true);
-  
-  let pendingCloudChanges = [];
-  let pendingLocalChanges = [];
-  
-  process.stdin.on('keypress', async (str, key) => {
-    if (key.name === 'y') {
-      // Pull cloud → local
-      await syncStagingToLocal();
-      console.log('[Pronghorn] Manual pull complete');
-    }
-    if (key.name === 'p') {
-      // Push local → cloud (flush queue)
-      for (const change of pendingLocalChanges) {
-        await pushLocalChangeToCloud(change.path, change.op, change.content);
-      }
-      pendingLocalChanges = [];
-    }
-    if (key.name === 's') {
-      // Full bidirectional sync
-      await syncStagingToLocal();
-      for (const change of pendingLocalChanges) {
-        await pushLocalChangeToCloud(change.path, change.op, change.content);
-      }
-      pendingLocalChanges = [];
-    }
-    if (key.name === 'a') {
-      // Toggle auto/manual
-      CONFIG.syncMode = CONFIG.syncMode === 'auto' ? 'manual' : 'auto';
-      console.log(`[Pronghorn] Sync mode: ${CONFIG.syncMode}`);
-    }
-    if (key.ctrl && key.name === 'c') {
-      process.exit(0);
-    }
-  });
-}
-```
-
+[Download icon] Download Schema DDL (.sql)
 ---
-
-## Changes Summary
-
-All changes are in a single file: `supabase/functions/generate-local-package/index.ts` (the generated runner script).
-
-| Change | Layer | Impact |
-|--------|-------|--------|
-| `cloudWrittenFiles` tracking map | 1 - Origin tracking | Prevents echo loops entirely |
-| Hash comparison before push | 1 - Origin tracking | Skips identical content pushes |
-| Cooldown window (2s) after cloud writes | 1 - Origin tracking | Safety net for hash collisions |
-| Burst detection with adaptive debounce | 2 - Debounce | Collapses rapid edits into single sync |
-| `SYNC_MODE=manual` option | 3 - Manual mode | Full user control during Claude sessions |
-| Keypress handlers (Y/P/S/A) | 3 - Manual mode | Interactive sync control |
-| `SYNC_MODE` config in .run file | 3 - Manual mode | Persistent preference |
-| Status line showing pending changes | 3 - Manual mode | Visibility into queue state |
-
-## New .run Configuration Options
-
-```text
-# SYNC SETTINGS (updated)
-REBUILD_ON_STAGING=true
-REBUILD_ON_FILES=true
-PUSH_LOCAL_CHANGES=true
-
-# NEW: Sync mode - 'auto' (realtime) or 'manual' (press keys to sync)
-SYNC_MODE=auto
+[Trash icon] Drop Schema CASCADE
 ```
-
-## Expected Behavior After Fix
-
-**Auto mode (default)**:
-- Cloud writes a file locally → chokidar fires → hash matches `cloudWrittenFiles` → push skipped (no loop)
-- User edits a file locally → chokidar fires → hash does NOT match → push proceeds normally
-- Claude Code edits 20 files rapidly → burst debounce collapses to single sync after 1.5s quiet period
-
-**Manual mode (for Claude Code sessions)**:
-- Cloud changes arrive → queued, status line shows "5 files pending pull"
-- User presses Y → all pending cloud changes written to disk at once
-- Local changes detected → queued, status shows "3 files pending push"
-- User presses P → all pending local changes pushed to cloud
-- User presses S → full bidirectional sync in one pass
-- User presses A → toggle back to auto mode
 
