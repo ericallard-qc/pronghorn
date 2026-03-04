@@ -1,70 +1,77 @@
 
-# Fix: Pronghorn Runner SSL Certificate Verification Failure
 
-## Problem
+# Truncation Issues in Build Agent and Other Edge Functions
 
-The pronghorn-runner fails to connect to `https://api.pronghorn.red` because Node.js cannot verify the SSL certificate for this custom Supabase domain. Every `fetch` call and WebSocket connection fails with `unable to verify the first certificate`. This breaks:
+## Findings
 
-- All RPC calls (file sync, staging, project data)
-- Realtime subscriptions (staging and files channels show `CHANNEL_ERROR`)
-- Log reporting (`report-local-issue` edge function calls)
+There are **multiple active truncation points** across the codebase that cut off user-provided content. Here is a complete inventory:
 
-## Root Cause
+### 1. **coding-agent-orchestrator** (Build Agent) -- `supabase/functions/coding-agent-orchestrator/index.ts`
 
-`api.pronghorn.red` is a custom domain pointing to Supabase. The SSL certificate chain served by this domain is incomplete -- the intermediate certificate is missing, so Node.js's strict TLS verification rejects it. This is a known issue with some custom domain / CDN setups.
+| Content Type | Truncation | Lines |
+|---|---|---|
+| Artifacts | Only first 5 shown, content sliced to 160 chars each | 646-654 |
+| Requirements | Only first 10 shown, content sliced to 160 chars each | 658-667 |
+| Canvas nodes | Only first 20 shown | 724-734 |
+| Canvas edges | Only first 20 shown | 738-743 |
+| Sample DB data | Only first 3 rows shown | 777 |
 
-## Fix
+**Not truncated** (full content passed): Standards, Tech Stacks, Repository Files, Database definitions.
 
-Add `NODE_TLS_REJECT_UNAUTHORIZED=0` at the very top of the generated runner script, immediately after the `.run` config is loaded but before any network calls. This tells Node.js to skip strict certificate chain verification.
+### 2. **orchestrate-agents** (Canvas AI Agent) -- `supabase/functions/orchestrate-agents/index.ts`
 
-### Change in `supabase/functions/generate-local-package/index.ts`
+| Content Type | Truncation | Line |
+|---|---|---|
+| Repository files | Content sliced to 500 chars each | 855 |
 
-Insert one line right after `loadRunConfig();` (after line 579):
+### 3. **decompose-requirements** -- `supabase/functions/decompose-requirements/index.ts`
 
-```javascript
-// Allow connections to custom domains with incomplete certificate chains
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+| Content Type | Truncation | Line |
+|---|---|---|
+| Artifact content | Sliced to 500 chars each | 510 |
+| File content | Sliced to 300 chars each | 537 |
+
+### 4. **Chat edge functions** (gemini, anthropic, xai)
+
+No truncation -- full `attachedContext` JSON is passed through.
+
+## Proposed Fix
+
+Remove all truncation from user-attached context. If the user explicitly attaches content via the ProjectSelector, the full content should be provided to the LLM.
+
+### File 1: `supabase/functions/coding-agent-orchestrator/index.ts`
+
+**Artifacts** (lines 644-655): Remove `.slice(0, 5)` and replace 160-char summary with full content:
+```
+Artifacts (N attached by user - FULL CONTENT):
+### ARTIFACT: {title}
+{full content}
 ```
 
-This is safe for the runner because:
-- It only runs locally on the developer's machine
-- It only connects to the known Pronghorn API endpoint
-- The alternative (broken sync) is worse than relaxed TLS for local dev
-
-### Additionally: Fix `node-fetch` calls with an HTTPS agent (belt-and-suspenders)
-
-The `node-fetch` library sometimes ignores `NODE_TLS_REJECT_UNAUTHORIZED`. As a backup, update the `reportLog` and `pushLocalChangeToCloud` functions to pass a custom HTTPS agent:
-
-Add a helper near the top of the runner script (after CONFIG):
-
-```javascript
-let httpsAgent = null;
-async function getHttpsAgent() {
-  if (!httpsAgent) {
-    const https = await import('https');
-    httpsAgent = new https.Agent({ rejectUnauthorized: false });
-  }
-  return httpsAgent;
-}
+**Requirements** (lines 657-668): Remove `.slice(0, 10)` and replace 160-char snippet with full content:
+```
+Requirements (N attached by user - FULL CONTENT):
+### REQ: {code} {title}
+{full content}
 ```
 
-Then in `reportLog` and `pushLocalChangeToCloud`, pass `agent: await getHttpsAgent()` to the `node-fetch` calls.
+**Canvas nodes** (lines 723-735): Remove `.slice(0, 20)`, include all nodes with full data.
 
-## Changes Summary
+**Canvas edges** (lines 737-744): Remove `.slice(0, 20)`, include all edges.
 
-| Location in generated runner | Change |
-|------------------------------|--------|
-| After `loadRunConfig()` | Add `process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'` |
-| After CONFIG block | Add `getHttpsAgent()` helper |
-| `reportLog` function | Add `agent` option to `node-fetch` call |
-| `pushLocalChangeToCloud` function | Add `agent` option to `node-fetch` call |
+**DB sample data** (line 777): Remove `.slice(0, 3)`, include all sample rows.
 
-All changes are in the single file: `supabase/functions/generate-local-package/index.ts` (the runner template).
+### File 2: `supabase/functions/orchestrate-agents/index.ts`
 
-## Expected Result
+**Repository files** (line 855): Remove the 500-char truncation, include full file content.
 
-After re-downloading the runner package, `npm start` will:
-- Successfully connect to `https://api.pronghorn.red`
-- Fetch files and staging data
-- Establish realtime subscriptions (no more `CHANNEL_ERROR`)
-- Report logs without SSL errors
+### File 3: `supabase/functions/decompose-requirements/index.ts`
+
+**Artifact content** (line 510): Remove 500-char truncation, include full content.
+
+**File content** (line 537): Remove 300-char truncation, include full content.
+
+## Summary
+
+Seven truncation points across three edge functions need to be updated. All three functions will need redeployment.
+
